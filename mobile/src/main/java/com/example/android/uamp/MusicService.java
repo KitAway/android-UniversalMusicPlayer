@@ -17,8 +17,10 @@
 package com.example.android.uamp;
 
 import android.app.PendingIntent;
+import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.graphics.Bitmap;
 import android.media.MediaDescription;
 import android.media.MediaMetadata;
@@ -150,6 +152,9 @@ public class MusicService extends MediaBrowserService implements Playback.Callba
     private MediaRouter mMediaRouter;
     private PackageValidator mPackageValidator;
 
+    private boolean mIsConnectedToCar;
+    private BroadcastReceiver mCarConnectionReceiver;
+
     /**
      * Consumer responsible for switching the Playback instances depending on whether
      * it is connected to a remote player.
@@ -166,6 +171,16 @@ public class MusicService extends MediaBrowserService implements Playback.Callba
             Playback playback = new CastPlayback(mMusicProvider);
             mMediaRouter.setMediaSession(mSession);
             switchToPlayer(playback, true);
+        }
+
+        @Override
+        public void onDisconnectionReason(int reason) {
+            LogHelper.d(TAG, "onDisconnectionReason");
+            // This is our final chance to update the underlying stream position
+            // In onDisconnected(), the underlying CastPlayback#mVideoCastConsumer
+            // is disconnected and hence we update our local value of stream position
+            // to the latest position.
+            mPlayback.updateLastKnownStreamPosition();
         }
 
         @Override
@@ -224,6 +239,18 @@ public class MusicService extends MediaBrowserService implements Playback.Callba
         mCastManager = VideoCastManager.getInstance();
         mCastManager.addVideoCastConsumer(mCastConsumer);
         mMediaRouter = MediaRouter.getInstance(getApplicationContext());
+
+        IntentFilter filter = new IntentFilter(CarHelper.ACTION_MEDIA_STATUS);
+        mCarConnectionReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                String connectionEvent = intent.getStringExtra(CarHelper.MEDIA_CONNECTION_STATUS);
+                mIsConnectedToCar = CarHelper.MEDIA_CONNECTED.equals(connectionEvent);
+                LogHelper.i(TAG, "Connection event to Android Auto: ", connectionEvent,
+                        " isConnectedToCar=", mIsConnectedToCar);
+            }
+        };
+        registerReceiver(mCarConnectionReceiver, filter);
     }
 
     /**
@@ -259,6 +286,7 @@ public class MusicService extends MediaBrowserService implements Playback.Callba
     @Override
     public void onDestroy() {
         LogHelper.d(TAG, "onDestroy");
+        unregisterReceiver(mCarConnectionReceiver);
         // Service is being killed, so make sure we release our resources
         handleStopRequest(null);
 
@@ -287,9 +315,11 @@ public class MusicService extends MediaBrowserService implements Playback.Callba
         }
         //noinspection StatementWithEmptyBody
         if (CarHelper.isValidCarPackage(clientPackageName)) {
-            // Optional: if your app needs to adapt ads, music library or anything else that
-            // needs to run differently when connected to the car, this is where you should handle
-            // it.
+            // Optional: if your app needs to adapt the music library to show a different subset
+            // when connected to the car, this is where you should handle it.
+            // If you want to adapt other runtime behaviors, like tweak ads or change some behavior
+            // that should be different on cars, you should instead use the boolean flag
+            // set by the BroadcastReceiver mCarConnectionReceiver (mIsConnectedToCar).
         }
         //noinspection StatementWithEmptyBody
         if (WearHelper.isValidWearCompanionPackage(clientPackageName)) {
@@ -517,14 +547,30 @@ public class MusicService extends MediaBrowserService implements Playback.Callba
             }
         }
 
+        /**
+         * Handle free and contextual searches.
+         *
+         * All voice searches on Android Auto are sent to this method through a connected
+         * {@link android.media.session.MediaController}.
+         * <p>
+         * Threads and async handling:
+         * In a real world application, searching should run in another thread.
+         *
+         * Since this method runs on the main thread, most apps with non-trivial metadata
+         * should defer the actual search to another thread (for example, by using
+         * an {@link android.os.AsyncTask}).
+         *
+         * Since our media metadata is very small, it is entirely loaded into
+         * memory during the {@link MusicProvider} initialization, and searching is an
+         * O(n) operation on a very small in-memory dataset. We only use an AsyncTask to wait
+         * if the {@link MusicProvider} has not yet been initialized.
+         **/
         @Override
         public void onPlayFromSearch(final String query, final Bundle extras) {
             LogHelper.d(TAG, "playFromSearch  query=", query, " extras=", extras);
 
             mPlayback.setState(PlaybackState.STATE_CONNECTING);
 
-            // Voice searches may occur before the media catalog has been
-            // prepared. We only handle the search after the musicProvider is ready.
             mMusicProvider.retrieveMediaAsync(new MusicProvider.Callback() {
                 @Override
                 public void onMusicCatalogReady(boolean success) {
@@ -812,7 +858,6 @@ public class MusicService extends MediaBrowserService implements Playback.Callba
         int oldState = mPlayback.getState();
         int pos = mPlayback.getCurrentStreamPosition();
         String currentMediaId = mPlayback.getCurrentMediaId();
-        LogHelper.d(TAG, "Current position from " + playback + " is ", pos);
         mPlayback.stop(false);
         playback.setCallback(this);
         playback.setCurrentStreamPosition(pos < 0 ? 0 : pos);
